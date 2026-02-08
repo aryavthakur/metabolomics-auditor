@@ -106,5 +106,96 @@ def main():
     print("✅ Validity report written to outputs/validity_report.md")
 
 
+
+def run_audit(csv_path="inputs/results.csv", report_path="outputs/validity_report.md", json_path=None):
+    """
+    Streamlit/Cloud-friendly wrapper.
+    Reads csv_path and writes report_path. Returns report markdown text.
+    """
+    import os
+    import pandas as pd
+
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Input CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+
+    n_rows, n_cols = df.shape
+
+    def find_col(keywords):
+        for k in keywords:
+            for c in df.columns:
+                if k in c.lower():
+                    return c
+        return None
+
+    p_col = find_col(["p", "pvalue"])
+    fdr_col = find_col(["fdr", "q", "adj"])
+    fc_col = find_col(["log2fc", "logfc", "fold"])
+
+    confidence = 100
+    interpretations = []
+    recommendations = []
+
+    if fc_col and not p_col:
+        confidence -= 40
+        interpretations.append(
+            "Fold-change values are present without corresponding p-values. Statistical significance cannot be assessed."
+        )
+        recommendations.append("Run a statistical test (e.g., t-test or ANOVA) to obtain p-values.")
+
+    if p_col and not fdr_col:
+        confidence -= 20
+        interpretations.append(
+            "P-values are present without multiple-testing correction (FDR/q-values). This increases false positive risk."
+        )
+        recommendations.append("Apply false discovery rate (FDR) correction to control multiple comparisons.")
+
+    if p_col and fdr_col:
+        interpretations.append(
+            "Both p-values and FDR-adjusted q-values are present, indicating statistically interpretable results."
+        )
+
+    confidence = max(confidence, 0)
+
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+
+    md = []
+    md.append("# Metabolomics Validity Report\n")
+    md.append("## Dataset Overview")
+    md.append(f"- Number of features (rows): {n_rows}")
+    md.append(f"- Number of columns: {n_cols}\n")
+
+    md.append("## Detected Statistical Columns")
+    md.append(f"- Fold change: {fc_col}")
+    md.append(f"- p-value: {p_col}")
+    md.append(f"- FDR / q-value: {fdr_col}\n")
+
+    md.append("## Scientific Interpretation")
+    if interpretations:
+        for i in interpretations:
+            md.append(f"- {i}")
+    else:
+        md.append("- No major statistical issues detected.\n")
+
+    md.append("\n## Recommendations")
+    if recommendations:
+        for r in recommendations:
+            md.append(f"- {r}")
+    else:
+        md.append("- No immediate corrective actions required.\n")
+
+    md.append("\n## Overall Confidence Score")
+    md.append(f"**{confidence} / 100**\n")
+
+    report_text = "\n".join(md)
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
+
+    return report_text
+def main():
+    run_audit()
+
 if __name__ == "__main__":
     main()

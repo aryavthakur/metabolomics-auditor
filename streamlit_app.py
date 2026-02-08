@@ -3,7 +3,7 @@ import shutil
 import streamlit as st
 import pandas as pd
 
-from audit import run_audit
+from main import run_audit
 from schema_mapper import detect_schema
 
 INPUT_DIR = "inputs"
