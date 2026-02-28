@@ -1,5 +1,4 @@
-# app.py (Fancy UI) — context-aware, schema-aware, Streamlit Cloud friendly
-
+# app.py — Validex (Fancy UI) • context-aware • schema-aware • Streamlit Cloud friendly
 from __future__ import annotations
 
 import os
@@ -44,6 +43,7 @@ REPORT_JSON_PATH = os.path.join(OUTPUT_DIR, "validity_report.json")
 st.set_page_config(
     page_title="Validex",
     page_icon="🧪",
+    layout="wide",
     initial_sidebar_state="collapsed",
 )
 
@@ -203,19 +203,14 @@ def extract_flags_from_report(md_text: str) -> list[dict]:
             section = section.split(stopper, 1)[0]
 
     lines = [ln.strip() for ln in section.splitlines() if ln.strip().startswith("- **")]
-    # Example line:
-    # - **MED** — No FDR/q-values detected: ...  \n  _Fix_: ...
     for ln in lines:
         try:
-            # Grab severity
             sev = re.search(r"\*\*(HIGH|MED|LOW)\*\*", ln)
             sev_txt = (sev.group(1).lower() if sev else "low")
 
-            # Title
             title_m = re.search(r"—\s*(.*?):", ln)
             title = title_m.group(1).strip() if title_m else "Flag"
 
-            # Why
             why_m = re.search(r":\s*(.*?)(?:\s{2,}|$)", ln)
             why = why_m.group(1).strip() if why_m else ""
 
@@ -226,6 +221,10 @@ def extract_flags_from_report(md_text: str) -> list[dict]:
 
 
 def build_context_ui(defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Context panel (reviewer decision tree style).
+    Stored in st.session_state.context and passed to main.run_audit(context=...).
+    """
     defaults = defaults or {}
 
     st.markdown("### Context")
@@ -260,7 +259,7 @@ def build_context_ui(defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any
             "Study goal",
             ["confirmatory", "exploratory"],
             index=0 if defaults.get("goal", "confirmatory") == "confirmatory" else 1,
-            help="confirmatory = claims need stricter stats; exploratory = patterns + validation.",
+            help="confirmatory = stricter stats; exploratory = patterns + validation emphasis.",
         )
         batch_expected = st.checkbox(
             "Batch effects likely",
@@ -275,7 +274,7 @@ def build_context_ui(defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any
             index=["unknown", "none", "log", "log2", "auto"].index(defaults.get("transform", "unknown")),
             help="What transform was applied before stats (often log/log2 in metabolomics).",
         )
-        alpha = st.text_input("Alpha", value=str(defaults.get("alpha", "0.05")))
+        alpha_raw = st.text_input("Alpha", value=str(defaults.get("alpha", "0.05")))
         comparison_label = st.text_input(
             "Comparison label",
             value=str(defaults.get("comparison_label", "")),
@@ -291,11 +290,11 @@ def build_context_ui(defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any
 
     # Parse alpha safely
     try:
-        alpha_val = float(alpha)
+        alpha_val = float(alpha_raw)
     except Exception:
         alpha_val = 0.05
 
-    context = {
+    return {
         "design_groups": design_groups,
         "paired": paired,
         "longitudinal": longitudinal,
@@ -307,7 +306,6 @@ def build_context_ui(defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any
         "comparison_label": comparison_label.strip(),
         "notes": notes.strip(),
     }
-    return context
 
 
 # ----------------------------
@@ -368,43 +366,41 @@ st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
 # ----------------------------
 _ensure_dirs()
 
-top = st.container()
-with top:
-    left, right = st.columns([0.62, 0.38], gap="large")
+left, right = st.columns([0.62, 0.38], gap="large")
 
-    with left:
-        st.markdown('<div class="glass">', unsafe_allow_html=True)
-        st.markdown("### Upload")
-        uploaded = st.file_uploader(
-            "Upload a metabolomics results CSV",
-            type=["csv"],
-            label_visibility="collapsed",
-        )
-        st.caption("Supported: .csv (up to 200MB). Processed locally in the app environment.")
-        st.markdown("</div>", unsafe_allow_html=True)
+with left:
+    st.markdown('<div class="glass">', unsafe_allow_html=True)
+    st.markdown("### Upload")
+    uploaded = st.file_uploader(
+        "Upload a metabolomics results CSV",
+        type=["csv"],
+        label_visibility="collapsed",
+    )
+    st.caption("Supported: .csv (up to 200MB). Processed locally in the app environment.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    with right:
-        st.markdown('<div class="glass">', unsafe_allow_html=True)
-        st.markdown("### Workflow")
-        step = 1
-        if st.session_state.uploaded_df is not None:
-            step = 2
-        if st.session_state.last_run_report is not None:
-            step = 4
+with right:
+    st.markdown('<div class="glass">', unsafe_allow_html=True)
+    st.markdown("### Workflow")
+    step = 1
+    if st.session_state.uploaded_df is not None:
+        step = 2
+    if st.session_state.last_run_report is not None:
+        step = 4
 
-        st.progress({1: 0.25, 2: 0.55, 3: 0.75, 4: 1.0}[step])
-        st.markdown(
-            """
-            <div class="small-muted">
-            <b>Step 1:</b> Upload CSV<br/>
-            <b>Step 2:</b> Preview + schema mapping<br/>
-            <b>Step 3:</b> Add context + run audit<br/>
-            <b>Step 4:</b> Export report
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown("</div>", unsafe_allow_html=True)
+    st.progress({1: 0.25, 2: 0.55, 3: 0.75, 4: 1.0}[step])
+    st.markdown(
+        """
+        <div class="small-muted">
+        <b>Step 1:</b> Upload CSV<br/>
+        <b>Step 2:</b> Preview + schema mapping<br/>
+        <b>Step 3:</b> Add context + run audit<br/>
+        <b>Step 4:</b> Export report
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 # When a new file is uploaded, load it and reset old results
@@ -492,8 +488,8 @@ with c:
     st.markdown("### Quick stats")
     st.metric("Rows", f"{df.shape[0]:,}")
     st.metric("Columns", f"{df.shape[1]:,}")
-    missing = int(df.isna().sum().sum())
-    st.metric("Missing cells", f"{missing:,}")
+    missing_cells = int(df.isna().sum().sum())
+    st.metric("Missing cells", f"{missing_cells:,}")
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
@@ -528,7 +524,7 @@ with run_left:
                 else:
                     raise RuntimeError("Neither main.run_audit nor main.main could be imported.")
             except TypeError:
-                # If their run_audit doesn't yet accept context, fail soft and rerun without it
+                # If their run_audit doesn't accept context yet, rerun without it
                 if run_audit_fn is not None:
                     _ = run_audit_fn(
                         csv_path=INPUT_PATH,
@@ -623,15 +619,14 @@ with tab_summary:
     st.markdown("<div style='height:14px;'></div>", unsafe_allow_html=True)
 
     # Simple effect-size plot if a likely FC/log2FC exists (best-effort)
-    # If schema_mapper is present, use it; otherwise scan heuristically.
     plot_col = None
     if schema_payload and schema_payload.get("canonical_to_original"):
         c2o = schema_payload["canonical_to_original"]
         plot_col = c2o.get("log2fc") or c2o.get("fold_change")
+
     if plot_col is None:
-        # heuristic fallback
-        cols = [c for c in df.columns]
-        lower = {c: c.lower() for c in cols}
+        cols = list(df.columns)
+        lower = {c: str(c).lower() for c in cols}
         for c in cols:
             lc = lower[c]
             if "log2fc" in lc or "logfc" in lc or "log2 fold" in lc:
