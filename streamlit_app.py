@@ -42,9 +42,8 @@ REPORT_JSON_PATH = os.path.join(OUTPUT_DIR, "validity_report.json")
 # Page config
 # ----------------------------
 st.set_page_config(
-    page_title="Metabolomics Validity Auditor",
+    page_title="Validex",
     page_icon="🧪",
-    layout="wide",
     initial_sidebar_state="collapsed",
 )
 
@@ -335,9 +334,9 @@ c1, c2 = st.columns([0.72, 0.28], gap="large")
 with c1:
     st.markdown(
         """
-        <div class="badge">🧪 <b>Metabolomics Validity Auditor</b> <span style="opacity:.7;">•</span> Streamlit app</div>
+        <div class="badge">🧪 <b>Validex</b><span style="opacity:.7;">•</span> Streamlit app</div>
         <div style="height:12px;"></div>
-        <div class="hero-title">Make metabolomics outputs<br/>auditable in seconds.</div>
+        <div class="hero-title">Validex<br/>Metabolomics Audit Engine.</div>
         <div class="small-muted">
           Upload a CSV → specify context → run audit → export report.
         </div>
