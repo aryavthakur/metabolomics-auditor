@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Iterable
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 
@@ -11,20 +11,122 @@ import pandas as pd
 # ------------------------------------------------------------
 # Canonical fields Validex cares about (expand over time)
 # ------------------------------------------------------------
-# NOTE:
-# - "fold_change" and "log2fc" are separated so we can prefer log2fc when present,
-#   but still accept FC-only exports.
-# - "feature" is optional but strongly recommended for readability / auditability.
+# Notes:
+# - We keep FC and log2FC separate.
+# - We intentionally include a lot of real-world export header variants (MetaboAnalyst,
+#   Skyline/other pipelines, vendor outputs, etc.).
 KNOWN_ALIASES: Dict[str, List[str]] = {
     "feature": [
-        "feature", "metabolite", "metabolite_name", "compound", "compound_name",
-        "name", "id", "identifier", "annotation", "analyte", "biochemical",
-        "peak", "peak_id", "m/z", "mz", "rt", "retention_time"
+        "feature",
+        "metabolite",
+        "metabolite_name",
+        "metabolite name",
+        "compound",
+        "compound_name",
+        "compound name",
+        "analyte",
+        "biochemical",
+        "biochemical name",
+        "name",
+        "identifier",
+        "id",
+        "annotation",
+        "feature_id",
+        "feature id",
+        "peak",
+        "peak_id",
+        "peak id",
+        "library_id",
+        "library id",
+        "hmdb",
+        "kegg",
+        "inchi",
+        "smiles",
     ],
-    "p_value": ["p", "pval", "pvalue", "p-value", "p.val", "p_value", "p value", "p_val"],
-    "fdr": ["fdr", "q", "qval", "qvalue", "q-value", "q value", "adj.p", "padj", "adj_p", "adjusted_p", "adj p"],
-    "fold_change": ["fc", "fold", "foldchange", "fold_change", "fold change"],
-    "log2fc": ["log2fc", "log_fc", "log2_fold_change", "log2 fold change", "log2(fc)", "log2 fc", "log fold change", "logfc"],
+    "p_value": [
+        "p",
+        "pval",
+        "pvalue",
+        "p_value",
+        "p value",
+        "p-val",
+        "p-value",
+        "p.val",
+        "p.value",
+        "p_val",
+        "pvalue (t-test)",
+        "p_value (t-test)",
+        "raw_p",
+        "raw p",
+        "unadjusted p",
+        "unadjusted_p",
+    ],
+    "fdr": [
+        "fdr",
+        "fdr_adj",
+        "fdr adjusted",
+        "fdr_adjusted",
+        "fdr adjusted p-value",
+        "fdr adjusted p value",
+        "fdr_adjusted_p_value",
+        "fdr_adjusted_pvalue",
+        "q",
+        "qval",
+        "qvalue",
+        "q_value",
+        "q value",
+        "q-value",
+        "adj.p",
+        "adj_p",
+        "adj p",
+        "adj p-value",
+        "adj p value",
+        "adj_p_value",
+        "adjusted_p",
+        "adjusted p",
+        "adjusted p-value",
+        "adjusted p value",
+        "adjusted_p_value",
+        "padj",
+        "p_adj",
+        "p-adj",
+        "p adj",
+        "bh",
+        "bh_fdr",
+        "bh fdr",
+        "bh_adj",
+        "bh adj",
+        "fdr_bh",
+        "fdr bh",
+        "adj.p.val",
+        "adj.p.val.",
+    ],
+    "fold_change": [
+        "fc",
+        "fold",
+        "foldchange",
+        "fold_change",
+        "fold change",
+        "fold-change",
+        "ratio",
+        "group_ratio",
+        "group ratio",
+        "mean_ratio",
+        "mean ratio",
+    ],
+    "log2fc": [
+        "log2fc",
+        "log2_fc",
+        "log2 fold change",
+        "log2_fold_change",
+        "log2(fold_change)",
+        "log2(fc)",
+        "log2 fc",
+        "log_fc",
+        "logfc",
+        "log fold change",
+        "log_fold_change",
+    ],
 }
 
 
@@ -42,8 +144,8 @@ def _norm_header(s: str) -> str:
     """
     s = str(s).strip().lower()
     s = s.replace("-", "_").replace(" ", "_").replace("/", "_")
-    s = re.sub(r"[^\w]+", "_", s)          # keep alnum + underscore
-    s = re.sub(r"_+", "_", s).strip("_")   # collapse underscores
+    s = re.sub(r"[^\w]+", "_", s)  # keep alnum + underscore
+    s = re.sub(r"_+", "_", s).strip("_")
     return s
 
 
@@ -67,7 +169,7 @@ def _coerce_numeric(series: pd.Series) -> pd.Series:
 
 
 def _numeric_rate(series: pd.Series) -> float:
-    """Fraction of non-null values that can be parsed as numeric."""
+    """Fraction of values coercible to numeric (0..1)."""
     if series is None or len(series) == 0:
         return 0.0
     num = _coerce_numeric(series)
@@ -77,8 +179,8 @@ def _numeric_rate(series: pd.Series) -> float:
 def _pvalue_plausibility(series: pd.Series) -> float:
     """
     Score p-value plausibility:
-    - numeric rate is required
-    - values should mostly fall in [0,1]
+    - numeric rate
+    - values mostly in [0,1]
     Returns 0..1.
     """
     num = _coerce_numeric(series)
@@ -88,35 +190,35 @@ def _pvalue_plausibility(series: pd.Series) -> float:
     if nr == 0.0:
         return 0.0
     in_range = float(((num >= 0) & (num <= 1)).mean())
-    # Weight numeric-ness heavily, but require range plausibility too
-    return 0.75 * nr + 0.25 * in_range
+    return float(max(0.0, min(1.0, 0.75 * nr + 0.25 * in_range)))
 
 
 def _effect_size_plausibility(series: pd.Series) -> float:
     """
     Score effect-size plausibility:
     - numeric rate is required
-    - we don't require a fixed range (FC can be huge), but we downweight absurd parse rates
     Returns 0..1.
     """
-    nr = _numeric_rate(series)
-    return nr
+    return float(max(0.0, min(1.0, _numeric_rate(series))))
 
 
 def _feature_plausibility(series: pd.Series) -> float:
     """
     Score feature/identifier plausibility:
     - prefer non-numeric-ish columns
-    - prefer high uniqueness (but not required)
+    - prefer reasonably unique values
     Returns 0..1.
     """
     if series is None or len(series) == 0:
         return 0.0
-    # If it's highly numeric, probably not a name column
+
     nr = _numeric_rate(series)
-    uniqueness = float(series.astype(str).nunique(dropna=True) / max(1, len(series)))
-    # We want low numeric rate, moderate uniqueness
-    score = (1.0 - min(1.0, nr)) * 0.7 + min(1.0, uniqueness) * 0.3
+    # uniqueness among non-null string values
+    s = series.dropna().astype(str)
+    uniq = float(s.nunique() / max(1, len(s))) if len(s) else 0.0
+
+    # Encourage low numeric rate + moderate uniqueness
+    score = (1.0 - min(1.0, nr)) * 0.7 + min(1.0, uniq) * 0.3
     return float(max(0.0, min(1.0, score)))
 
 
@@ -138,7 +240,6 @@ class SchemaMap:
       list of canonicals that had no plausible match
     scores:
       canonical -> list of (original_col, score) sorted high->low.
-      This lets main.py serialize scores for transparency (optional).
     """
     canonical_to_original: Dict[str, str]
     canonical_to_normed: Dict[str, str]
@@ -147,10 +248,7 @@ class SchemaMap:
     scores: Dict[str, List[Tuple[str, float]]]
 
     def rename_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Return a copy of df with matched columns renamed to canonical names.
-        Only renames matches; does not drop anything.
-        """
+        """Return a copy of df with matched columns renamed to canonical names."""
         rename_map = {orig: canon for canon, orig in self.canonical_to_original.items()}
         return df.rename(columns=rename_map).copy()
 
@@ -158,24 +256,30 @@ class SchemaMap:
 # ------------------------------------------------------------
 # Core schema detection
 # ------------------------------------------------------------
-def detect_schema(df: pd.DataFrame, aliases: Optional[Dict[str, List[str]]] = None) -> SchemaMap:
+def detect_schema(
+    df: pd.DataFrame,
+    aliases: Optional[Dict[str, List[str]]] = None,
+) -> SchemaMap:
     """
     Detect canonical columns in df using:
     1) robust header normalization + alias sets
-    2) data-aware scoring to choose the best match when multiple candidates exist
+    2) fuzzy header matching (substring containment)
+    3) data-aware scoring to choose the best match when multiple candidates exist
 
-    Returns SchemaMap:
+    Returns SchemaMap with:
       - canonical_to_original mapping
       - ambiguities (if multiple candidates match)
       - missing canonicals
       - scores per canonical (candidate ranking)
     """
     aliases = aliases or KNOWN_ALIASES
-
     cols: List[str] = [str(c) for c in df.columns]
-    normed_cols: Dict[str, List[str]] = {}
+    normed: Dict[str, str] = {c: _norm_header(c) for c in cols}
+
+    # Reverse index for exact normalized header matches
+    norm_to_originals: Dict[str, List[str]] = {}
     for c in cols:
-        normed_cols.setdefault(_norm_header(c), []).append(c)
+        norm_to_originals.setdefault(normed[c], []).append(c)
 
     canonical_to_original: Dict[str, str] = {}
     canonical_to_normed: Dict[str, str] = {}
@@ -183,30 +287,60 @@ def detect_schema(df: pd.DataFrame, aliases: Optional[Dict[str, List[str]]] = No
     missing: List[str] = []
     scores: Dict[str, List[Tuple[str, float]]] = {}
 
-    def header_match_candidates(canon: str, alias_list: Iterable[str]) -> List[str]:
-        """Return all original columns whose normalized header matches any alias."""
-        candidates = [canon] + list(alias_list)
-        found: List[str] = []
-        for a in candidates:
-            a_norm = _norm_header(a)
-            if a_norm in normed_cols:
-                found.extend(normed_cols[a_norm])
-        # Deduplicate preserving order
-        seen = set()
-        out = []
-        for x in found:
-            if x not in seen:
-                seen.add(x)
-                out.append(x)
+    def header_score(col_norm: str, alias_norm: str) -> float:
+        """
+        Header similarity score (0..1).
+        - exact match => 1.0
+        - substring match (alias inside col or col inside alias) => 0.65
+        - token overlap (weak) => 0.45
+        """
+        if col_norm == alias_norm:
+            return 1.0
+        if alias_norm and (alias_norm in col_norm or col_norm in alias_norm):
+            return 0.65
+
+        col_tokens = set(col_norm.split("_"))
+        alias_tokens = set(alias_norm.split("_"))
+        if not col_tokens or not alias_tokens:
+            return 0.0
+        overlap = len(col_tokens & alias_tokens) / max(1, len(alias_tokens))
+        if overlap >= 0.6:
+            return 0.45
+        if overlap >= 0.4:
+            return 0.25
+        return 0.0
+
+    def candidate_columns_for(canon: str, alias_list: Iterable[str]) -> List[Tuple[str, float]]:
+        """
+        Generate (col, best_header_score) candidates for a canonical field.
+        We search:
+        - exact normalized matches against aliases
+        - fuzzy matches by scanning all columns (small df, ok)
+        """
+        alias_norms = {_norm_header(canon)} | {_norm_header(a) for a in alias_list}
+
+        cand: Dict[str, float] = {}
+
+        # Exact matches first
+        for a_norm in alias_norms:
+            for orig in norm_to_originals.get(a_norm, []):
+                cand[orig] = max(cand.get(orig, 0.0), 1.0)
+
+        # Fuzzy scan
+        for col in cols:
+            cn = normed[col]
+            best = 0.0
+            for a_norm in alias_norms:
+                best = max(best, header_score(cn, a_norm))
+            if best > 0.0:
+                cand[col] = max(cand.get(col, 0.0), best)
+
+        # Return sorted by header score (desc) so we evaluate stronger header matches first
+        out = [(c, float(hs)) for c, hs in cand.items()]
+        out.sort(key=lambda x: x[1], reverse=True)
         return out
 
-    def score_candidate(canon: str, col: str) -> float:
-        """
-        Data-aware scoring 0..1:
-        - p_value / fdr: prefer numeric + range plausibility
-        - fold_change / log2fc: prefer numeric
-        - feature: prefer non-numeric + reasonably unique
-        """
+    def data_score(canon: str, col: str) -> float:
         s = df[col] if col in df.columns else None
         if s is None:
             return 0.0
@@ -214,43 +348,65 @@ def detect_schema(df: pd.DataFrame, aliases: Optional[Dict[str, List[str]]] = No
         if canon == "p_value":
             return _pvalue_plausibility(s)
         if canon == "fdr":
-            # fdr behaves like p-values: usually [0,1]
             return _pvalue_plausibility(s)
         if canon in ("fold_change", "log2fc"):
             return _effect_size_plausibility(s)
         if canon == "feature":
             return _feature_plausibility(s)
 
-        # fallback: prefer numeric-ish columns slightly
-        return _numeric_rate(s) * 0.5
+        return 0.0
+
+    def combined_score(canon: str, col: str, hscore: float) -> float:
+        """
+        Combine header score + data plausibility.
+        Weighting:
+        - header matters (prevents grabbing random numeric columns)
+        - data plausibility matters more for stat columns
+        """
+        dscore = data_score(canon, col)
+
+        # feature headers can vary wildly; let data plausibility drive more
+        if canon == "feature":
+            w_h, w_d = 0.35, 0.65
+        else:
+            w_h, w_d = 0.45, 0.55
+
+        return float(max(0.0, min(1.0, w_h * hscore + w_d * dscore)))
+
+    # minimum confidence to accept a mapping at all
+    min_accept: Dict[str, float] = {
+        "feature": 0.22,
+        "p_value": 0.35,
+        "fdr": 0.35,
+        "fold_change": 0.30,
+        "log2fc": 0.30,
+    }
 
     for canon, alias_list in aliases.items():
-        cands = header_match_candidates(canon, alias_list)
+        cands = candidate_columns_for(canon, alias_list)
 
         if not cands:
             missing.append(canon)
             scores[canon] = []
             continue
 
-        ranked = [(c, float(score_candidate(canon, c))) for c in cands]
+        ranked = [(col, combined_score(canon, col, h)) for col, h in cands]
         ranked.sort(key=lambda x: x[1], reverse=True)
+        scores[canon] = [(c, float(s)) for c, s in ranked]
 
-        scores[canon] = ranked
-
-        # Determine ambiguity: more than one candidate with decent score
-        # Thresholds:
-        # - if top score is weak, still pick deterministic but mark as ambiguous if others close
         top_col, top_score = ranked[0]
+        if top_score < min_accept.get(canon, 0.30):
+            missing.append(canon)
+            continue
 
-        # "plausible" means score >= 0.35 for stat cols, >= 0.25 for feature
-        plausible_cut = 0.25 if canon == "feature" else 0.35
+        # Ambiguity: if there are multiple plausible close contenders
+        plausible_cut = max(min_accept.get(canon, 0.30), top_score - 0.10)
         plausible = [c for c, sc in ranked if sc >= plausible_cut]
-
         if len(plausible) > 1:
             ambiguities[canon] = plausible
 
         canonical_to_original[canon] = top_col
-        canonical_to_normed[canon] = _norm_header(top_col)
+        canonical_to_normed[canon] = normed[top_col]
 
     return SchemaMap(
         canonical_to_original=canonical_to_original,
@@ -265,16 +421,11 @@ def detect_schema(df: pd.DataFrame, aliases: Optional[Dict[str, List[str]]] = No
 # Backward-compatible helpers
 # ------------------------------------------------------------
 def normalize_columns(df: pd.DataFrame) -> Dict[str, str]:
-    """
-    Backward-compatible API:
-    returns canonical -> original column mapping.
-    """
+    """Backward-compatible API: returns canonical -> original mapping."""
     return detect_schema(df).canonical_to_original
 
 
 def apply_canonical_schema(df: pd.DataFrame) -> Tuple[pd.DataFrame, SchemaMap]:
-    """
-    Convenience helper: detects schema and returns (renamed_df, schema_map).
-    """
+    """Convenience helper: returns (renamed_df, schema_map)."""
     sm = detect_schema(df)
     return sm.rename_df(df), sm
