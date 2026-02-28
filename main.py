@@ -3,61 +3,108 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, Dict, Optional
+from dataclasses import asdict
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 
 from schema_mapper import apply_canonical_schema, detect_schema
 
-# NEW: context support
-from context_engine import Context, context_expectations, context_narrative, default_context
-
+# Default IO (your Streamlit UI writes to these)
 INPUT_PATH = "inputs/results.csv"
-OUTPUT_PATH = "outputs/validity_report.md"
+OUTPUT_MD_PATH = "outputs/validity_report.md"
+OUTPUT_JSON_PATH = "outputs/validity_report.json"
+CONTEXT_JSON_PATH = "inputs/context.json"  # optional (only used if present)
 
 
-def _safe_makedirs(path: str) -> None:
+# ----------------------------
+# Small utilities
+# ----------------------------
+def _safe_makedirs_for_file(path: str) -> None:
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
 
 
+def _read_optional_json(path: str) -> Optional[Dict[str, Any]]:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def _as_percent(x: float) -> str:
     try:
-        return f"{x * 100:.1f}%"
+        return f"{x*100:.1f}%"
     except Exception:
         return "—"
 
 
-def _numeric_coerce_rate(series: pd.Series) -> float:
-    """Approximate fraction of values coercible to numeric."""
+def _coerce_numeric(series: pd.Series) -> pd.Series:
+    """Forgiving numeric coercion (handles '<0.001', commas, blanks)."""
     if series is None or len(series) == 0:
-        return 0.0
+        return pd.Series(dtype="float64")
     if pd.api.types.is_numeric_dtype(series):
-        return float(series.notna().mean())
+        return pd.to_numeric(series, errors="coerce")
 
     s = series.astype(str).str.strip()
     s = s.str.replace(r"^[<>]=?\s*", "", regex=True)  # "<0.001" -> "0.001"
     s = s.str.replace(",", "", regex=False)
     s = s.replace({"": pd.NA, "nan": pd.NA, "NaN": pd.NA, "None": pd.NA})
-    num = pd.to_numeric(s, errors="coerce")
-    return float(num.notna().mean())
+    return pd.to_numeric(s, errors="coerce")
 
 
+def _numeric_parse_rate(series: pd.Series) -> float:
+    num = _coerce_numeric(series)
+    return float(num.notna().mean()) if len(num) else 0.0
+
+
+def _fraction_in_range(series: pd.Series, lo: float, hi: float) -> float:
+    num = _coerce_numeric(series)
+    if len(num) == 0:
+        return 0.0
+    mask = num.notna()
+    if mask.sum() == 0:
+        return 0.0
+    return float(((num[mask] >= lo) & (num[mask] <= hi)).mean())
+
+
+def _detect_pvalue_like_issues(series: pd.Series) -> Tuple[float, float]:
+    """
+    Returns (numeric_rate, in_0_1_rate).
+    Useful for p-values and FDR.
+    """
+    nr = _numeric_parse_rate(series)
+    r01 = _fraction_in_range(series, 0.0, 1.0)
+    return nr, r01
+
+
+def _is_probably_log2fc(colname: Optional[str]) -> bool:
+    if not colname:
+        return False
+    s = colname.lower()
+    return "log2" in s or "log2fc" in s or "log_fc" in s or "logfc" in s
+
+
+# ----------------------------
+# Core audit
+# ----------------------------
 def run_audit(
     csv_path: str = INPUT_PATH,
-    report_path: str = OUTPUT_PATH,
-    json_path: Optional[str] = None,
-    context: Optional[dict] = None,
+    report_md_path: str = OUTPUT_MD_PATH,
+    report_json_path: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Validex audit entrypoint.
 
     - Reads csv_path
-    - Detects schema via schema_mapper (header + data-aware scoring)
-    - Writes markdown report to report_path
-    - Optionally writes a machine-readable JSON payload to json_path
-    - Accepts an optional user-provided context dict that changes expectations/scoring
-    - Returns markdown report text
+    - Detects schema via schema_mapper
+    - Generates report markdown (and optional JSON)
+    - Returns markdown text
     """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Input CSV not found: {csv_path}")
@@ -65,202 +112,220 @@ def run_audit(
     df = pd.read_csv(csv_path)
     n_rows, n_cols = df.shape
 
-    # ----------------------------
-    # Context (fail-soft)
-    # ----------------------------
-    ctx_obj = default_context()
-    if isinstance(context, dict):
-        try:
-            ctx_obj = Context(**context)
-        except Exception:
-            # Keep defaults if invalid/partial context
-            ctx_obj = default_context()
+    # Optional context: argument wins, else inputs/context.json if present
+    ctx = context or _read_optional_json(CONTEXT_JSON_PATH)
 
-    cx = context_expectations(ctx_obj)
-
-    # ----------------------------
-    # Detect + canonicalize schema
-    # ----------------------------
+    # Detect schema on raw df (so we can report original column names)
     sm = detect_schema(df)
 
-    # Canonicalize columns for downstream checks (non-destructive)
-    canonical_df, sm2 = apply_canonical_schema(df)  # noqa: F841  (kept for future downstream checks)
+    # Canonicalize columns for easier downstream checks (non-destructive)
+    canon_df, _ = apply_canonical_schema(df)
 
-    # Resolve detected columns (original names) for report display
+    # Pull detected columns (original names)
     feature_col = sm.canonical_to_original.get("feature")
     p_col = sm.canonical_to_original.get("p_value")
     fdr_col = sm.canonical_to_original.get("fdr")
     fc_col = sm.canonical_to_original.get("fold_change")
     log2fc_col = sm.canonical_to_original.get("log2fc")
 
+    # Safety: sometimes fold_change alias list includes log2fc-ish headers.
+    # Prefer log2fc_col for log2, and keep fc_col as "FC" if it doesn't look log-like.
+    if fc_col and _is_probably_log2fc(fc_col) and not log2fc_col:
+        log2fc_col = fc_col
+        fc_col = None
+
     # ----------------------------
-    # Scientific interpretation / scoring
+    # Scoring + flags
     # ----------------------------
     confidence = 100
     interpretations: list[str] = []
     recommendations: list[str] = []
-    flags: list[dict[str, Any]] = []
+    flags: list[Dict[str, Any]] = []
 
     def flag(severity: str, title: str, why: str, fix: str) -> None:
         flags.append({"severity": severity, "title": title, "why": why, "fix": fix})
 
-    # Feature / identifier column
+    # Feature column
     if not feature_col:
         confidence -= 10
         interpretations.append(
-            "No clear metabolite/feature identifier column was detected; interpretation may be harder for humans."
+            "No clear metabolite/feature identifier column was detected; results are harder to audit and cite."
         )
         recommendations.append(
-            "Include a first column with metabolite/feature names (e.g., 'Metabolite', 'Compound', 'Feature')."
+            "Add a column like 'Metabolite', 'Compound', or 'Feature' as a human-readable identifier."
         )
         flag(
             "med",
             "No metabolite/feature ID detected",
-            "A clear feature identifier improves interpretability and export consistency.",
-            "Add a metabolite/feature name column.",
+            "A feature identifier improves interpretability and export consistency.",
+            "Add a metabolite/feature name/ID column.",
         )
 
-    # p-values (context-aware)
-    if cx["expect_p_values"] and not p_col:
+    # p-values
+    if not p_col:
         confidence -= 35
         interpretations.append(
-            "Context suggests inferential claims are expected, but no p-values were detected. Treat results as exploratory only."
+            "No p-values were detected. Without p-values, statistical significance cannot be assessed (exploratory output)."
         )
         recommendations.append(
-            "Export statistical test results that include a p-value column (and specify the test used)."
+            "Export your univariate test output (t-test/ANOVA/mixed model) including a p-value column."
         )
         flag(
             "high",
-            "Missing p-values (context-required)",
-            "Given the study context, inferential statistics are expected.",
-            "Include p-values from your statistical test output.",
+            "No p-values detected",
+            "You can’t assess statistical significance; results are exploratory only.",
+            "Include a p-value column from your statistical pipeline.",
         )
-    elif p_col:
-        # Data sanity: p-values should be mostly numeric
-        p_series = df[p_col]
-        numeric_rate = _numeric_coerce_rate(p_series)
-        if numeric_rate < 0.8:
+    else:
+        p_nr, p_r01 = _detect_pvalue_like_issues(df[p_col])
+        if p_nr < 0.8:
             confidence -= 10
             interpretations.append(
-                f"The detected p-value column ('{p_col}') has low numeric parse rate ({_as_percent(numeric_rate)})."
+                f"P-value column '{p_col}' has low numeric parse rate ({_as_percent(p_nr)})."
             )
             recommendations.append(
-                "Clean the p-value column (remove text/junk; keep numeric values like 0.001 or 1e-5)."
+                "Clean p-values to numeric (e.g., 0.001 or 1e-5). Remove text/junk and unify formatting."
             )
             flag(
                 "med",
                 "P-value column may be messy",
-                f"Only {_as_percent(numeric_rate)} of values look numeric.",
-                "Clean/standardize p-values to numeric values.",
+                f"Only {_as_percent(p_nr)} of values look numeric.",
+                "Standardize p-values to numeric values.",
+            )
+        if p_r01 < 0.9:
+            confidence -= 10
+            interpretations.append(
+                f"P-value column '{p_col}' contains many values outside [0,1] ({_as_percent(1 - p_r01)} out-of-range)."
+            )
+            recommendations.append(
+                "Verify that the detected column truly contains p-values (not -log10(p), scores, or test statistics)."
+            )
+            flag(
+                "med",
+                "P-values out of range",
+                "Many values are outside the valid p-value range [0,1].",
+                "Check if this column is -log10(p) or another statistic; rename/export correctly.",
             )
 
-    # FDR / q-values (context-aware)
-    if cx["expect_fdr"] and p_col and not fdr_col:
+    # FDR/q-values (only meaningful if p-values exist)
+    if p_col and not fdr_col:
         confidence -= 20
         interpretations.append(
-            "Context implies high-dimensional testing (untargeted), but no multiple-testing correction (FDR/q-values) was detected."
+            "P-values were detected without multiple-testing correction (FDR/q-values). This increases false positive risk in high-dimensional metabolomics."
         )
         recommendations.append(
-            "Add FDR/q-values (e.g., Benjamini–Hochberg) when many metabolites/features are tested."
+            "Add BH-FDR (q-values) when testing many metabolites/features."
         )
         flag(
             "med",
-            "Missing FDR/q-values (context-required)",
-            "Untargeted metabolomics typically requires multiple-testing correction.",
-            "Add an FDR/q-value column (BH-adjusted p-values).",
+            "No FDR/q-values detected",
+            "Multiple-testing correction isn’t available in this file.",
+            "Add an FDR/q-value column (e.g., Benjamini–Hochberg).",
         )
-    elif p_col and fdr_col:
-        interpretations.append(
-            "Both p-values and FDR/q-values were detected, indicating multiple-testing control is present."
-        )
+    elif fdr_col:
+        fdr_nr, fdr_r01 = _detect_pvalue_like_issues(df[fdr_col])
+        if fdr_nr < 0.8:
+            confidence -= 5
+            interpretations.append(
+                f"FDR/q-value column '{fdr_col}' has low numeric parse rate ({_as_percent(fdr_nr)})."
+            )
+            recommendations.append("Clean q-values to numeric values (0..1).")
+            flag(
+                "low",
+                "FDR column may be messy",
+                f"Only {_as_percent(fdr_nr)} of values look numeric.",
+                "Standardize q-values to numeric values.",
+            )
+        if fdr_r01 < 0.9:
+            confidence -= 5
+            interpretations.append(
+                f"FDR/q-value column '{fdr_col}' contains many values outside [0,1]."
+            )
+            recommendations.append(
+                "Verify the q-value/FDR export (q-values should be between 0 and 1)."
+            )
+            flag(
+                "low",
+                "FDR values out of range",
+                "Some values are outside [0,1].",
+                "Check export and column selection; ensure true q-values.",
+            )
 
-    # Effect size (FC/log2FC) (context-aware)
-    if cx["expect_effect_size"] and not fc_col and not log2fc_col:
+    # Effect size (FC/log2FC)
+    if not fc_col and not log2fc_col:
         confidence -= 20
         interpretations.append(
-            "No fold-change or log2 fold-change column was detected. Without effect size, practical significance and directionality are harder to interpret."
+            "No fold-change (FC) or log2FC column was detected. Without effect size, directionality and practical significance are harder to interpret."
         )
-        recommendations.append("Include Fold Change (FC) or log2FC in your exported results.")
+        recommendations.append("Include FC and/or log2FC in your exported results.")
         flag(
             "high",
-            "Missing effect size (FC/log2FC)",
-            "Reviewers expect effect size alongside significance in metabolomics reporting.",
-            "Include Fold Change or log2FC in the results export.",
+            "No effect size detected (FC/log2FC)",
+            "Without FC/log2FC, effect size isn’t interpretable.",
+            "Include Fold Change (FC) or log2FC in the export.",
+        )
+    else:
+        eff_col = log2fc_col or fc_col
+        if eff_col:
+            nr = _numeric_parse_rate(df[eff_col])
+            if nr < 0.8:
+                confidence -= 5
+                interpretations.append(
+                    f"Effect size column '{eff_col}' has low numeric parse rate ({_as_percent(nr)})."
+                )
+                recommendations.append(
+                    "Ensure effect sizes are numeric (remove annotations/strings)."
+                )
+                flag(
+                    "low",
+                    "Effect size column may be messy",
+                    f"Only {_as_percent(nr)} of values look numeric.",
+                    "Standardize effect sizes to numeric values.",
+                )
+
+    # Common “bad export” pattern: effect size present, no p-values
+    if (fc_col or log2fc_col) and not p_col:
+        interpretations.append(
+            "Effect sizes are present without p-values; treat this as exploratory reporting (not statistical evidence)."
         )
 
-    # If effect size exists but p-values do not, add targeted note
-    if (fc_col or log2fc_col) and not p_col and cx["expect_p_values"]:
-        interpretations.append(
-            "Effect-size values are present without p-values; do not treat this as statistical evidence without inferential testing."
-        )
-        recommendations.append(
-            "Run a statistical test and include p-values (and ideally FDR) alongside effect sizes."
-        )
+    # Context-aware nudges (optional, lightweight)
+    if ctx:
+        # These are *recommendation nudges*; don’t hard-fail.
+        design = str(ctx.get("design", "")).lower()  # e.g., "paired", "independent", "repeated"
+        n_groups = ctx.get("n_groups", None)
+        targeted = str(ctx.get("mode", "")).lower()  # e.g., "targeted", "untargeted"
 
-    # Paired/longitudinal caution note (context-only)
-    if cx["expect_paired_awareness"]:
-        interpretations.append(
-            "Design is paired/longitudinal: ensure your statistical test accounts for within-subject correlation (paired tests or mixed-effects models)."
-        )
-        recommendations.append(
-            "If not already done, use paired t-test / repeated-measures ANOVA / mixed-effects model instead of independent tests."
-        )
-        flag(
-            "low",
-            "Paired/longitudinal design check",
-            "Independent-sample tests on repeated measures inflate error.",
-            "Confirm paired/mixed modeling was used and documented.",
-        )
+        if targeted == "untargeted" and p_col and not fdr_col:
+            # already flagged, but reinforce as “context mismatch”
+            interpretations.append(
+                "Context: Untargeted metabolomics typically requires multiple-testing correction; missing FDR is a common reviewer red flag."
+            )
 
-    # Batch effects caution note (context-only)
-    if cx["expect_batch_handling"]:
-        interpretations.append(
-            "Batch effects are likely: ensure normalization/batch correction (or QC-based correction) is documented to avoid instrument-driven differences."
-        )
-        recommendations.append(
-            "Document batch correction approach (QC-based normalization, ComBat, mixed models, etc.)."
-        )
-        flag(
-            "low",
-            "Batch effects check",
-            "Uncorrected batches can masquerade as biological signal.",
-            "Add batch correction/normalization details.",
-        )
+        if design in ("paired", "repeated", "longitudinal"):
+            recommendations.append(
+                "Context note: If samples are paired/repeated measures, ensure your stats use paired tests or mixed models (not independent tests)."
+            )
 
-    # Small-n caution note
-    if cx["small_n_risk"]:
-        confidence -= 5
-        interpretations.append(
-            "Small sample size increases instability and false discoveries; emphasize effect sizes and conservative interpretation."
-        )
-        recommendations.append(
-            "Consider nonparametric tests/bootstrapping and report confidence intervals where possible."
-        )
-        flag(
-            "med",
-            "Small-n risk",
-            "Small n reduces power and increases variance in estimates.",
-            "Use conservative stats + effect sizes + CIs.",
-        )
+        if isinstance(n_groups, int) and n_groups >= 3:
+            recommendations.append(
+                "Context note: For 3+ groups, ANOVA/Welch ANOVA/Kruskal–Wallis (or linear models) are typical; avoid multiple pairwise t-tests without correction."
+            )
 
     confidence = max(0, min(100, confidence))
 
     # ----------------------------
-    # Build report (Markdown)
+    # Build Markdown report
     # ----------------------------
-    _safe_makedirs(report_path)
+    _safe_makedirs_for_file(report_md_path)
 
     md: list[str] = []
     md.append("# Metabolomics Validity Report\n")
+    md.append(f"_Generated: {datetime.now().isoformat(timespec='seconds')}_\n")
 
     md.append("## Dataset Overview")
-    md.append(f"- Number of rows (features): {n_rows}")
-    md.append(f"- Number of columns: {n_cols}\n")
-
-    md.append("## Context (user-provided)")
-    for line in context_narrative(ctx_obj):
-        md.append(f"- {line}")
-    md.append("")
+    md.append(f"- Rows (features): {n_rows}")
+    md.append(f"- Columns: {n_cols}\n")
 
     md.append("## Detected Statistical Columns (schema-mapped)")
     md.append(f"- Feature / metabolite ID: {feature_col}")
@@ -269,18 +334,22 @@ def run_audit(
     md.append(f"- p-value: {p_col}")
     md.append(f"- FDR / q-value: {fdr_col}\n")
 
-    # Transparent “fail-soft” mapping notes
-    if getattr(sm, "ambiguities", None):
-        if sm.ambiguities:
-            md.append("## Schema Ambiguities")
-            for canon, cands in sm.ambiguities.items():
-                md.append(f"- **{canon}** matched multiple columns: {', '.join(cands)}")
-            md.append("")
+    if sm.ambiguities:
+        md.append("## Schema Ambiguities")
+        for canon, cands in sm.ambiguities.items():
+            md.append(f"- **{canon}** matched multiple columns: {', '.join(cands)}")
+        md.append("")
 
-    if getattr(sm, "missing", None):
-        if sm.missing:
-            md.append("## Missing Canonical Fields")
-            md.append("- " + ", ".join(sm.missing) + "\n")
+    if sm.missing:
+        md.append("## Missing Canonical Fields")
+        md.append("- " + ", ".join(sm.missing) + "\n")
+
+    if ctx:
+        md.append("## Context (user-provided)")
+        # Keep this compact and readable
+        for k, v in ctx.items():
+            md.append(f"- {k}: {v}")
+        md.append("")
 
     md.append("## Scientific Interpretation")
     if interpretations:
@@ -292,7 +361,14 @@ def run_audit(
 
     md.append("## Recommendations")
     if recommendations:
+        # de-dupe while preserving order
+        seen = set()
+        recs = []
         for r in recommendations:
+            if r not in seen:
+                seen.add(r)
+                recs.append(r)
+        for r in recs:
             md.append(f"- {r}")
     else:
         md.append("- No immediate corrective actions required.")
@@ -312,19 +388,18 @@ def run_audit(
 
     report_text = "\n".join(md)
 
-    with open(report_path, "w", encoding="utf-8") as f:
+    with open(report_md_path, "w", encoding="utf-8") as f:
         f.write(report_text)
 
     # ----------------------------
-    # Optional JSON output (machine-readable)
+    # Optional JSON output
     # ----------------------------
-    if json_path:
-        _safe_makedirs(json_path)
+    if report_json_path:
+        _safe_makedirs_for_file(report_json_path)
+
         payload: Dict[str, Any] = {
             "input": {"csv_path": csv_path},
             "overview": {"n_rows": n_rows, "n_cols": n_cols},
-            "context": ctx_obj.to_dict(),
-            "context_expectations": cx,
             "detected": {
                 "feature": feature_col,
                 "fold_change": fc_col,
@@ -333,14 +408,13 @@ def run_audit(
                 "fdr": fdr_col,
             },
             "schema": {
-                "canonical_to_original": getattr(sm, "canonical_to_original", {}),
-                "missing": getattr(sm, "missing", []),
-                "ambiguities": getattr(sm, "ambiguities", {}),
-                "scores": {
-                    k: [(c, float(s)) for c, s in v]
-                    for k, v in getattr(sm, "scores", {}).items()
-                },
+                "canonical_to_original": sm.canonical_to_original,
+                "missing": sm.missing,
+                "ambiguities": sm.ambiguities,
+                # scores exists in your rewritten schema_mapper.py
+                "scores": {k: [(c, float(s)) for c, s in v] for k, v in sm.scores.items()},
             },
+            "context": ctx,
             "analysis": {
                 "confidence": confidence,
                 "interpretations": interpretations,
@@ -348,7 +422,8 @@ def run_audit(
                 "flags": flags,
             },
         }
-        with open(json_path, "w", encoding="utf-8") as jf:
+
+        with open(report_json_path, "w", encoding="utf-8") as jf:
             json.dump(payload, jf, indent=2)
 
     return report_text
@@ -356,18 +431,21 @@ def run_audit(
 
 def main() -> None:
     """
-    CLI-style entrypoint.
-    Streamlit should import run_audit directly.
+    CLI entrypoint.
+    Streamlit should call run_audit(), not this.
     """
     print("🔍 Starting metabolomics auditor...")
-    print(f"Checking for input file at: {INPUT_PATH}")
     if not os.path.exists(INPUT_PATH):
-        print("❌ results.csv not found")
+        print(f"❌ Input not found: {INPUT_PATH}")
         return
 
-    _safe_makedirs(OUTPUT_PATH)
-    run_audit(csv_path=INPUT_PATH, report_path=OUTPUT_PATH)
-    print("✅ Validity report written to outputs/validity_report.md")
+    _safe_makedirs_for_file(OUTPUT_MD_PATH)
+    run_audit(
+        csv_path=INPUT_PATH,
+        report_md_path=OUTPUT_MD_PATH,
+        report_json_path=OUTPUT_JSON_PATH,
+    )
+    print(f"✅ Report written: {OUTPUT_MD_PATH}")
 
 
 if __name__ == "__main__":
