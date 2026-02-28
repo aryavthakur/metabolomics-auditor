@@ -13,8 +13,8 @@ from schema_mapper import apply_canonical_schema, detect_schema
 
 # Default IO (your Streamlit UI writes to these)
 INPUT_PATH = "inputs/results.csv"
-OUTPUT_MD_PATH = "outputs/validity_report.md"
-OUTPUT_JSON_PATH = "outputs/validity_report.json"
+OUTPUT_MD_PATH = "outputs/validex_report.md"
+OUTPUT_JSON_PATH = "outputs/validex_report.json"
 CONTEXT_JSON_PATH = "inputs/context.json"  # optional (only used if present)
 
 
@@ -320,7 +320,7 @@ def run_audit(
     _safe_makedirs_for_file(report_md_path)
 
     md: list[str] = []
-    md.append("# Metabolomics Validity Report\n")
+    md.append("# Validex Audit Report\n")
     md.append(f"_Generated: {datetime.now().isoformat(timespec='seconds')}_\n")
 
     md.append("## Dataset Overview")
