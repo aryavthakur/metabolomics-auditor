@@ -1,6 +1,8 @@
-# app.py — Validex (Fancy UI) • context-aware • schema-aware • Streamlit Cloud friendly
+# app.py (Fancy UI) — Validex
+# Context-aware + schema-aware + Streamlit Cloud friendly
 from __future__ import annotations
 
+import inspect
 import os
 import re
 from typing import Any, Dict, Optional
@@ -46,6 +48,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
 
 # ----------------------------
 # Global CSS (Cursor-ish)
@@ -189,20 +192,19 @@ def severity_pill(sev: str) -> str:
 
 def extract_flags_from_report(md_text: str) -> list[dict]:
     """
-    Best-effort parse for the '## Flags' section produced by main.py.
-    If absent, returns [].
+    Best-effort parse for a '## Flags' section produced by main.py.
     """
     flags: list[dict] = []
     if "## Flags" not in md_text:
         return flags
 
     section = md_text.split("## Flags", 1)[1]
-    # stop at next header if any
     for stopper in ["\n## ", "\n# "]:
         if stopper in section:
             section = section.split(stopper, 1)[0]
 
     lines = [ln.strip() for ln in section.splitlines() if ln.strip().startswith("- **")]
+
     for ln in lines:
         try:
             sev = re.search(r"\*\*(HIGH|MED|LOW)\*\*", ln)
@@ -217,14 +219,11 @@ def extract_flags_from_report(md_text: str) -> list[dict]:
             flags.append({"severity": sev_txt, "title": title, "why": why, "fix": ""})
         except Exception:
             continue
+
     return flags
 
 
 def build_context_ui(defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Context panel (reviewer decision tree style).
-    Stored in st.session_state.context and passed to main.run_audit(context=...).
-    """
     defaults = defaults or {}
 
     st.markdown("### Context")
@@ -259,7 +258,7 @@ def build_context_ui(defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any
             "Study goal",
             ["confirmatory", "exploratory"],
             index=0 if defaults.get("goal", "confirmatory") == "confirmatory" else 1,
-            help="confirmatory = stricter stats; exploratory = patterns + validation emphasis.",
+            help="confirmatory = claims need stricter stats; exploratory = patterns + validation.",
         )
         batch_expected = st.checkbox(
             "Batch effects likely",
@@ -274,7 +273,7 @@ def build_context_ui(defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any
             index=["unknown", "none", "log", "log2", "auto"].index(defaults.get("transform", "unknown")),
             help="What transform was applied before stats (often log/log2 in metabolomics).",
         )
-        alpha_raw = st.text_input("Alpha", value=str(defaults.get("alpha", "0.05")))
+        alpha_in = st.text_input("Alpha", value=str(defaults.get("alpha", "0.05")))
         comparison_label = st.text_input(
             "Comparison label",
             value=str(defaults.get("comparison_label", "")),
@@ -288,9 +287,8 @@ def build_context_ui(defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any
         height=90,
     )
 
-    # Parse alpha safely
     try:
-        alpha_val = float(alpha_raw)
+        alpha_val = float(alpha_in)
     except Exception:
         alpha_val = 0.05
 
@@ -308,6 +306,51 @@ def build_context_ui(defaults: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     }
 
 
+def _call_run_audit(
+    fn,
+    *,
+    csv_path: str,
+    report_path: str,
+    json_path: str,
+    context: Optional[Dict[str, Any]] = None,
+):
+    """
+    Call main.run_audit even if its parameter names differ.
+    Avoids Streamlit Cloud 'TypeError' when your signature changes.
+    """
+    sig = inspect.signature(fn)
+    params = set(sig.parameters.keys())
+
+    kwargs: Dict[str, Any] = {}
+
+    # CSV path mapping
+    for k in ["csv_path", "input_csv", "input_path", "csv"]:
+        if k in params:
+            kwargs[k] = csv_path
+            break
+
+    # Markdown report path mapping
+    for k in ["report_path", "report_md_path", "md_path", "output_md", "report_md"]:
+        if k in params:
+            kwargs[k] = report_path
+            break
+
+    # JSON report path mapping
+    for k in ["json_path", "report_json_path", "output_json", "report_json"]:
+        if k in params:
+            kwargs[k] = json_path
+            break
+
+    # Context mapping (optional)
+    if context is not None:
+        for k in ["context", "ctx", "meta", "run_context"]:
+            if k in params:
+                kwargs[k] = context
+                break
+
+    return fn(**kwargs)
+
+
 # ----------------------------
 # Session state
 # ----------------------------
@@ -315,7 +358,6 @@ for k, v in {
     "uploaded_df": None,
     "uploaded_name": None,
     "last_run_report": None,
-    "last_run_path": None,
     "last_run_json": None,
     "context": {},
 }.items():
@@ -350,7 +392,6 @@ with c2:
         st.session_state.uploaded_df = None
         st.session_state.uploaded_name = None
         st.session_state.last_run_report = None
-        st.session_state.last_run_path = None
         st.session_state.last_run_json = None
         st.session_state.context = {}
         _clear_paths()
@@ -366,41 +407,43 @@ st.markdown("<div style='height:16px;'></div>", unsafe_allow_html=True)
 # ----------------------------
 _ensure_dirs()
 
-left, right = st.columns([0.62, 0.38], gap="large")
+top = st.container()
+with top:
+    left, right = st.columns([0.62, 0.38], gap="large")
 
-with left:
-    st.markdown('<div class="glass">', unsafe_allow_html=True)
-    st.markdown("### Upload")
-    uploaded = st.file_uploader(
-        "Upload a metabolomics results CSV",
-        type=["csv"],
-        label_visibility="collapsed",
-    )
-    st.caption("Supported: .csv (up to 200MB). Processed locally in the app environment.")
-    st.markdown("</div>", unsafe_allow_html=True)
+    with left:
+        st.markdown('<div class="glass">', unsafe_allow_html=True)
+        st.markdown("### Upload")
+        uploaded = st.file_uploader(
+            "Upload a metabolomics results CSV",
+            type=["csv"],
+            label_visibility="collapsed",
+        )
+        st.caption("Supported: .csv (up to 200MB). Processed locally in the app environment.")
+        st.markdown("</div>", unsafe_allow_html=True)
 
-with right:
-    st.markdown('<div class="glass">', unsafe_allow_html=True)
-    st.markdown("### Workflow")
-    step = 1
-    if st.session_state.uploaded_df is not None:
-        step = 2
-    if st.session_state.last_run_report is not None:
-        step = 4
+    with right:
+        st.markdown('<div class="glass">', unsafe_allow_html=True)
+        st.markdown("### Workflow")
+        step = 1
+        if st.session_state.uploaded_df is not None:
+            step = 2
+        if st.session_state.last_run_report is not None:
+            step = 4
 
-    st.progress({1: 0.25, 2: 0.55, 3: 0.75, 4: 1.0}[step])
-    st.markdown(
-        """
-        <div class="small-muted">
-        <b>Step 1:</b> Upload CSV<br/>
-        <b>Step 2:</b> Preview + schema mapping<br/>
-        <b>Step 3:</b> Add context + run audit<br/>
-        <b>Step 4:</b> Export report
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.progress({1: 0.25, 2: 0.55, 3: 0.75, 4: 1.0}[step])
+        st.markdown(
+            """
+            <div class="small-muted">
+            <b>Step 1:</b> Upload CSV<br/>
+            <b>Step 2:</b> Preview + schema mapping<br/>
+            <b>Step 3:</b> Add context + run audit<br/>
+            <b>Step 4:</b> Export report
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
 
 # When a new file is uploaded, load it and reset old results
@@ -414,7 +457,6 @@ if uploaded is not None:
     st.session_state.uploaded_df = df
     st.session_state.uploaded_name = uploaded.name
     st.session_state.last_run_report = None
-    st.session_state.last_run_path = None
     st.session_state.last_run_json = None
 
     _clear_paths()
@@ -432,7 +474,7 @@ if st.session_state.uploaded_df is None:
           <div class="glass">
             <h3 style="margin-top:0;">👆 Upload a CSV to begin</h3>
             <div class="small-muted">
-              After upload: you’ll see preview, schema mapping, context input, and “Run audit”.
+              After upload: preview, schema mapping, context input, and “Run audit”.
             </div>
           </div>
         </div>
@@ -447,7 +489,6 @@ if st.session_state.uploaded_df is None:
 # ----------------------------
 df = st.session_state.uploaded_df
 
-# Schema mapping (preferred)
 schema_payload: dict = {}
 if detect_schema is not None:
     try:
@@ -494,12 +535,16 @@ with c:
 
 st.markdown("<div style='height:18px;'></div>", unsafe_allow_html=True)
 
-# Context + run
+
+# ----------------------------
+# Context + Run
+# ----------------------------
 run_left, run_right = st.columns([0.68, 0.32], gap="large")
 
 with run_left:
     st.markdown('<div class="glass">', unsafe_allow_html=True)
     st.markdown("### Context + Run audit")
+
     st.session_state.context = build_context_ui(st.session_state.context or {})
 
     st.markdown("<div style='height:10px;'></div>", unsafe_allow_html=True)
@@ -511,28 +556,17 @@ with run_left:
         with st.spinner("Running audit..."):
             try:
                 if run_audit_fn is not None:
-                    # New API (supports context)
-                    _ = run_audit_fn(
+                    _call_run_audit(
+                        run_audit_fn,
                         csv_path=INPUT_PATH,
                         report_path=REPORT_MD_PATH,
                         json_path=REPORT_JSON_PATH,
                         context=st.session_state.context,
                     )
                 elif legacy_main is not None:
-                    # Old API fallback (no context)
                     legacy_main()
                 else:
                     raise RuntimeError("Neither main.run_audit nor main.main could be imported.")
-            except TypeError:
-                # If their run_audit doesn't accept context yet, rerun without it
-                if run_audit_fn is not None:
-                    _ = run_audit_fn(
-                        csv_path=INPUT_PATH,
-                        report_path=REPORT_MD_PATH,
-                        json_path=REPORT_JSON_PATH,
-                    )
-                else:
-                    raise
             except Exception as e:
                 st.error(f"Audit crashed: {e}")
                 st.stop()
@@ -540,11 +574,10 @@ with run_left:
         if os.path.exists(REPORT_MD_PATH):
             md = open(REPORT_MD_PATH, "r", encoding="utf-8", errors="ignore").read()
             st.session_state.last_run_report = md
-            st.session_state.last_run_path = REPORT_MD_PATH
             st.session_state.last_run_json = REPORT_JSON_PATH if os.path.exists(REPORT_JSON_PATH) else None
             st.success("Done ✅ Audit report created.")
         else:
-            st.error("Audit ran, but no report was created in outputs/. Check main.py OUTPUT_PATH.")
+            st.error("Audit ran, but no report was created in outputs/. Check main.py output paths.")
     st.markdown("</div>", unsafe_allow_html=True)
 
 with run_right:
@@ -602,6 +635,8 @@ with tab_summary:
             f"- Targeted: `{ctx.get('targeted', False)}`",
             f"- Goal: `{ctx.get('goal','confirmatory')}`",
             f"- Batch expected: `{ctx.get('batch_expected', False)}`",
+            f"- Transform: `{ctx.get('transform','unknown')}`",
+            f"- Alpha: `{ctx.get('alpha', 0.05)}`",
         ]
         st.markdown("\n".join(ctx_lines))
 
@@ -618,7 +653,7 @@ with tab_summary:
 
     st.markdown("<div style='height:14px;'></div>", unsafe_allow_html=True)
 
-    # Simple effect-size plot if a likely FC/log2FC exists (best-effort)
+    # Simple effect-size plot if a likely FC/log2FC exists
     plot_col = None
     if schema_payload and schema_payload.get("canonical_to_original"):
         c2o = schema_payload["canonical_to_original"]
@@ -697,6 +732,6 @@ with tab_report:
 with tab_data:
     st.markdown('<div class="glass">', unsafe_allow_html=True)
     st.markdown("## Data")
-    st.caption("Renders only after you upload (no stale preview).")
+    st.caption("Renders only after you upload.")
     st.dataframe(df, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
