@@ -49,7 +49,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
-
+st.markdown("## Validex UI Build; 2026-03-05 15:27 (TEST)")
+st.caption("Uf you dont see this line, Streamlit Cloud is NOT running htis file/commit")
 
 # ----------------------------
 # Global CSS (Cursor-ish)
